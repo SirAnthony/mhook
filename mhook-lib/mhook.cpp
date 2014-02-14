@@ -1,5 +1,6 @@
-//Copyright (c) 2007-2008, Marton Anka
+//
 //Copyright (c) 2014, Sir Anthony
+//Copyright (c) 2007-2008, Marton Anka
 //
 //Permission is hereby granted, free of charge, to any person obtaining a
 //copy of this software and associated documentation files (the "Software"),
@@ -98,6 +99,11 @@ inline void __cdecl odprintf(PCWSTR format, ...) {
 //=========================================================================
 #define MHOOKS_MAX_CODE_BYTES	32
 #define MHOOKS_MAX_RIPS			 4
+// Limit is based on real vm page size and this number.
+// It works as upper limit only when this number less than
+// real number of trampolines page can hold.
+// Feel free to set it big, but beware that this number
+// controls allocated flag char array size directly.
 #define MHOOKS_MAX_TRAMPOLINES_PER_PAGE 512
 
 //=========================================================================
@@ -272,7 +278,6 @@ static PBYTE EmitJump(PBYTE pbCode, PBYTE pbJumpTo) {
 static MHOOKS_TRAMPOLINE* TrampolineAllocInNewPage(PBYTE pbAlloc, SIZE_T size)
 {
 	MHOOKS_PAGEINFO* info = NULL;
-	MHOOKS_TRAMPOLINE* trampoline = NULL;
 	int offset = sizeof(MHOOKS_PAGEINFO);
 	int count = (size - offset) / sizeof(MHOOKS_TRAMPOLINE);
 	if (count < 1)
@@ -318,13 +323,19 @@ static MHOOKS_TRAMPOLINE* TrampolineAllocNum(MHOOKS_PAGEINFO* info, unsigned num
 		return NULL;
 
 	SIZE_T info_size = sizeof(MHOOKS_PAGEINFO);
-	SIZE_T block_size = sizeof(MHOOKS_TRAMPOLINE);
+	SIZE_T szTrampoline = sizeof(MHOOKS_TRAMPOLINE);
 	DWORD dwOldProtectMode = 0;
 	HANDLE hProc = GetCurrentProcess();
 	VirtualProtectEx(hProc, info, info_size, PAGE_EXECUTE_READWRITE, &dwOldProtectMode);
 	info->Allocated[num] = 1;
 	VirtualProtectEx(hProc, info, info_size, dwOldProtectMode, &dwOldProtectMode);
-	return (MHOOKS_TRAMPOLINE*)(info->FirstItem + num * block_size);
+	// Find new trampoline location
+	MHOOKS_TRAMPOLINE* pTrampoline = (MHOOKS_TRAMPOLINE*)(info->FirstItem + num * szTrampoline);
+	// Clean trampoline memory
+	VirtualProtectEx(hProc, pTrampoline, szTrampoline, PAGE_EXECUTE_READWRITE, &dwOldProtectMode);
+	SecureZeroMemory(pTrampoline, szTrampoline);
+	VirtualProtectEx(hProc, pTrampoline, szTrampoline, dwOldProtectMode, &dwOldProtectMode);
+	return pTrampoline;
 }
 
 static MHOOKS_TRAMPOLINE* TrampolineAllocInPages(PBYTE lower, PBYTE upper)
@@ -347,7 +358,68 @@ static MHOOKS_TRAMPOLINE* TrampolineAllocInPages(PBYTE lower, PBYTE upper)
 	return NULL;
 }
 
-// TODO: free functions
+static void TrampolineFreeBlock(MHOOKS_TRAMPOLINE* pTrampoline, BOOL bNeverUsed)
+{
+	// It might be OK to call VirtualFree, but quite possibly it isn't:
+	// If a thread has some of our trampoline code on its stack
+	// and we yank the region from underneath it then it will
+	// surely crash upon returning. So instead of freeing the
+	// memory we just let it leak. Ugly, but safe.
+	if (!bNeverUsed)
+		return;
+
+	// Find block, trampoline in by getting aligning address to page
+	// and comparison with blocks list
+	SYSTEM_INFO sSysInfo =  {0};
+	::GetSystemInfo(&sSysInfo);
+	SIZE_T szPageInfo = sizeof(MHOOKS_PAGEINFO);
+	SIZE_T szTrampoline = sizeof(MHOOKS_TRAMPOLINE);
+	MHOOKS_PAGEINFO* pBlock = g_pAllocatedBlocks;
+	SIZE_T szMinPage = szPageInfo + szTrampoline;
+	if (sSysInfo.dwAllocationGranularity > szMinPage)
+		szMinPage = sSysInfo.dwAllocationGranularity;
+	PBYTE pbStart = (PBYTE)(ULONG_PTR((ULONG_PTR(pTrampoline) +
+								 (sSysInfo.dwAllocationGranularity - 1)
+								 ) / sSysInfo.dwAllocationGranularity
+								) * sSysInfo.dwAllocationGranularity);
+	// pbStart points at pervious page
+	pbStart -= ULONG_PTR(szMinPage);
+
+	while (pBlock && (PBYTE)pBlock != pbStart)
+		pBlock = pBlock->Next;
+
+	if (!pBlock){
+		// Trampoline not in allocated block. This is unexpected,
+		// assume that it is page itself
+		VirtualFree(pTrampoline, 0, MEM_RELEASE);
+		return;
+	}
+
+	DWORD dwOldProtectMode = 0;
+	HANDLE hProc = GetCurrentProcess();
+	int num = ULONG_PTR(ULONG_PTR(pTrampoline) -
+						ULONG_PTR(pBlock) - ULONG_PTR(szPageInfo)) / szTrampoline;
+	VirtualProtectEx(hProc, pBlock, szPageInfo, PAGE_EXECUTE_READWRITE, &dwOldProtectMode);
+	pBlock->Allocated[num] = 0;
+	VirtualProtectEx(hProc, pBlock, szPageInfo, dwOldProtectMode, &dwOldProtectMode);
+
+	// Todo: strange way to do so
+	int left = 0;
+	for(unsigned i = 0; i < pBlock->LastAllowed; ++i)
+		left += pBlock->Allocated[i];
+
+	if (!left) {
+		// Free block, it have no trampolines now.
+		if (pBlock->Perv)
+			pBlock->Perv->Next = pBlock->Next;
+		if (pBlock->Next)
+			pBlock->Next->Perv = pBlock->Perv;
+		if (pBlock == g_pAllocatedBlocks)
+			g_pAllocatedBlocks = pBlock->Next;
+		VirtualFree(pBlock, 0, MEM_RELEASE);
+	}
+}
+
 
 
 //=========================================================================
@@ -381,11 +453,11 @@ static MHOOKS_TRAMPOLINE* TrampolineAlloc(PBYTE pSystemFunction, S64 nLimitUp, S
 
 			SYSTEM_INFO sSysInfo =  {0};
 			::GetSystemInfo(&sSysInfo);
-			SIZE_T page_info_size = sizeof(MHOOKS_PAGEINFO);
-			SIZE_T trampoline_size = sizeof(MHOOKS_TRAMPOLINE);
-			SIZE_T min_size = page_info_size + trampoline_size;
-			if (sSysInfo.dwAllocationGranularity > min_size)
-				min_size = sSysInfo.dwAllocationGranularity;
+			SIZE_T szPageInfo = sizeof(MHOOKS_PAGEINFO);
+			SIZE_T szTrampoline = sizeof(MHOOKS_TRAMPOLINE);
+			SIZE_T szMinPage = szPageInfo + szTrampoline;
+			if (sSysInfo.dwAllocationGranularity > szMinPage)
+				szMinPage = sSysInfo.dwAllocationGranularity;
 
 
 			// go through the available memory blocks and try to allocate a chunk for us
@@ -396,14 +468,14 @@ static MHOOKS_TRAMPOLINE* TrampolineAlloc(PBYTE pSystemFunction, S64 nLimitUp, S
 				if (!VirtualQuery(pbAlloc, &mbi, sizeof(mbi)))
 					break;
 				// free & large enough?
-				if (mbi.State == MEM_FREE && mbi.RegionSize >= min_size) {
+				if (mbi.State == MEM_FREE && mbi.RegionSize >= szMinPage) {
 					// yes, align the pointer to the 64K boundary first
 					pbAlloc = (PBYTE)(ULONG_PTR((ULONG_PTR(pbAlloc) +
 												 (sSysInfo.dwAllocationGranularity-1)
 												 ) / sSysInfo.dwAllocationGranularity
 												) * sSysInfo.dwAllocationGranularity);
 					// and then try to allocate it
-					pTrampoline = TrampolineAllocInNewPage(pbAlloc, min_size);
+					pTrampoline = TrampolineAllocInNewPage(pbAlloc, szMinPage);
 					if (pTrampoline) {
 						ODPRINTF((L"mhooks: TrampolineAlloc: Allocated block at %p as the trampoline", pTrampoline));
 						break;
@@ -456,13 +528,7 @@ static VOID TrampolineFree(MHOOKS_TRAMPOLINE* pTrampoline, BOOL bNeverUsed) {
 	for (DWORD i=0; i<MHOOKS_MAX_SUPPORTED_HOOKS; i++) {
 		if (g_pHooks[i] == pTrampoline) {
 			g_pHooks[i] = NULL;
-			// It might be OK to call VirtualFree, but quite possibly it isn't:
-			// If a thread has some of our trampoline code on its stack
-			// and we yank the region from underneath it then it will
-			// surely crash upon returning. So instead of freeing the
-			// memory we just let it leak. Ugly, but safe.
-			if (bNeverUsed)
-				VirtualFree(pTrampoline, 0, MEM_RELEASE);
+			TrampolineFreeBlock(pTrampoline, bNeverUsed);
 			g_nHooksInUse--;
 			break;
 		}

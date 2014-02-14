@@ -9,10 +9,5 @@ Changes
 
 1. CMake build.
 2. Maximum hooks number increased.
-3. Placing more than 1 hook to allocated memory page. 64KB is too much for 
+3. Placing more than 1 hook to allocated memory page. 64KB is too much for
    only one 100-bytes trampoline.
- 
-TODO
--------
-
-- Memory deallocation not implemented yet.
