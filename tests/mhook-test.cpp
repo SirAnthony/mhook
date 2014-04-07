@@ -119,12 +119,17 @@ ULONG WINAPI HookNtClose(HANDLE hHandle) {
 //=========================================================================
 // This is where the work gets done.
 //
+
+#ifndef _MSC_VER
+int main(int argc, WCHAR* argv[])
+#else
 int wmain(int argc, WCHAR* argv[])
+#endif
 {
 	HANDLE hProc = NULL;
 
 	// Set the hook
-	if (Mhook_SetHook((PVOID*)&TrueNtOpenProcess, HookNtOpenProcess)) {
+	if (Mhook_SetHook((PVOID*)&TrueNtOpenProcess, reinterpret_cast<PVOID>(HookNtOpenProcess))) {
 		// Now call OpenProcess and observe NtOpenProcess being redirected
 		// under the hood.
 		hProc = OpenProcess(PROCESS_ALL_ACCESS, 
@@ -155,7 +160,7 @@ int wmain(int argc, WCHAR* argv[])
 	// extra work under the hood to make things work properly. This really
 	// is more of a test case rather than a demo.)
 	printf("Testing SelectObject.\n");
-	if (Mhook_SetHook((PVOID*)&TrueSelectObject, HookSelectobject)) {
+	if (Mhook_SetHook((PVOID*)&TrueSelectObject, reinterpret_cast<PVOID>(HookSelectobject))) {
 		// error checking omitted for brevity. doesn't matter much 
 		// in this context anyway.
 		HDC hdc = GetDC(NULL);
@@ -171,7 +176,7 @@ int wmain(int argc, WCHAR* argv[])
 	}
 
 	printf("Testing getaddrinfo.\n");
-	if (Mhook_SetHook((PVOID*)&Truegetaddrinfo, Hookgetaddrinfo)) {
+	if (Mhook_SetHook((PVOID*)&Truegetaddrinfo, reinterpret_cast<PVOID>(Hookgetaddrinfo))) {
 		// error checking omitted for brevity. doesn't matter much 
 		// in this context anyway.
 		WSADATA wd = {0};
@@ -198,7 +203,7 @@ int wmain(int argc, WCHAR* argv[])
 	}
 
 	printf("Testing HeapAlloc.\n");
-	if (Mhook_SetHook((PVOID*)&TrueHeapAlloc, HookHeapAlloc))
+	if (Mhook_SetHook((PVOID*)&TrueHeapAlloc, reinterpret_cast<PVOID>(HookHeapAlloc)))
 	{
 		free(malloc(10));
 		// Remove the hook
@@ -206,7 +211,7 @@ int wmain(int argc, WCHAR* argv[])
 	}
 
 	printf("Testing NtClose.\n");
-	if (Mhook_SetHook((PVOID*)&TrueNtClose, HookNtClose))
+	if (Mhook_SetHook((PVOID*)&TrueNtClose, reinterpret_cast<PVOID>(HookNtClose)))
 	{
 		CloseHandle(NULL);
 		// Remove the hook
@@ -215,4 +220,3 @@ int wmain(int argc, WCHAR* argv[])
 
 	return 0;
 }
-

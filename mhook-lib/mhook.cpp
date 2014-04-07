@@ -23,8 +23,17 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdio.h>
+#include <cctype>
 #include "mhook.h"
 #include "../disasm-lib/disasm.h"
+
+#ifdef __GNUC__
+# define vsprintf_s vsnprintf
+# define vswprintf_s vsnwprintf
+# ifndef SecureZeroMemory
+#  define SecureZeroMemory(p,s) RtlFillMemory((p),(s),0)
+# endif
+#endif
 
 //=========================================================================
 #ifndef cntof
